@@ -1,0 +1,16 @@
+{
+  "name": "familydownloader",
+  "version": "1.0.0",
+  "description": "Download Famly pictures and observations",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "commander": "^9.4.1",
+    "uuid": "^9.0.0"
+  }
+}
