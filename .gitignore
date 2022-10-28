@@ -1,3 +1,9 @@
+backups/
+downloads/
+downloads\ copy/
+samples/
+
+
 # Logs
 logs
 *.log
