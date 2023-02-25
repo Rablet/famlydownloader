@@ -1,15 +1,17 @@
-import { createWriteStream } from "fs";
+import { createWriteStream, existsSync, mkdirSync } from "fs";
 import { v4 } from "uuid";
 import { program } from "commander";
 
 import { pipeline } from "node:stream";
 import { promisify } from "node:util";
 
+import { exiftool } from "exiftool-vendored";
+
 program
   .requiredOption("-u, --username <string>")
   .requiredOption("-p, --password <string>")
   .option(
-    "-df, --downloadfolder <string>",
+    "-df, --download-folder <string>",
     "Relative download folder.  Defaults to downloads/",
     "downloads/"
   )
@@ -17,6 +19,22 @@ program
     "--graphqlurl <string>",
     "The URL for GraphQL.  Defaults to https://app.famly.co/graphql",
     "https://app.famly.co/graphql"
+  )
+  .option(
+    "-d, --days <integer>",
+    "Number of days to download, defaults to 30. --download-since will take presedence over this",
+    "30"
+  )
+  .option(
+    "-ds, --download-since <date>",
+    "Download all media posted after this date. Must be in a format accepted by the new Date() constructor. Takes priority over --days if both are specified"
+  )
+  .option("--disable-exif", "Disables setting the exif dates of photos.")
+  .option("-v", "--verbose", "Verbose logging.")
+  .option(
+    "-ht, --height-target <integer>",
+    "The height target to use when fetching feed items. Higher number = fewer requests.  Defaults to 10000",
+    10000
   );
 
 program.parse();
@@ -25,12 +43,27 @@ const options = program.opts();
 //const limit = options.first ? 1 : undefined;
 const username = options.username;
 const password = options.password;
-const downloadFolder = options.downloadfolder;
+const downloadFolder = options.downloadFolder;
 const graphqlURL = options.graphqlurl;
-console.log(username);
-console.log(password);
-console.log(downloadFolder);
-console.log(graphqlURL);
+
+const daysToDownload = options.days;
+const downloadMediaSince = new Date(options.downloadSince);
+
+const disableExif = options.downloadSince;
+const verbose = options.verbose;
+const heightTarget = options.heightTarget;
+
+if (verbose) {
+  console.log(`Settings: ${options}`);
+}
+
+try {
+  if (!existsSync(downloadFolder)) {
+    mkdirSync(downloadFolder);
+  }
+} catch (err) {
+  console.error(`Could not create download folder: ${err}`);
+}
 
 const installationId = v4();
 
@@ -49,15 +82,18 @@ getData(username, password);
 async function getData(username, password) {
   // First log in and get an access token
   const accessToken = await login(username, password);
-  // Get the feed. This will download the feed media and also return all observationIds
-  const observationIds = await getFeed(accessToken);
-  // Download the media from observations
-  await getObservations(accessToken, observationIds);
+  if (verbose) {
+    console.log(`Access Token : ${accessToken}`);
+  }
+  // Get the feed. This will download the feed media and observation data
+  await getFeed(accessToken);
 }
 
 async function getObservations(accessToken, observationIds) {
+  if (verbose) {
+    console.log(`Downloading Observations IDs: ${observationIds}`);
+  }
   // This is the graphql query to fetch all observations.
-  // FIXME: Don't fetch all in one go. Split it up in chunks
   const query = `
     "query ObservationsByIds($observationIds: [ObservationId!]!) {  childDevelopment {    observations(      first: 2147483647 observationIds: $observationIds      ignoreMissing: true    ) {      results {        ...ObservationData        __typename      }      __typename    }    __typename  }}fragment ObservationData on Observation {  ...ObservationDataWithNoComments  __typename}fragment ObservationDataWithNoComments on Observation {  children {    id    name    institutionId    __typename  }  id  version  feedItem {    id    __typename  }  status {    state    createdAt    __typename  }  variant  images {    height    width    id    secret {      crop      expires      key      path      prefix      __typename    }    __typename  }  video {    ... on TranscodingVideo {      id      __typename    }    ... on TranscodedVideo {      duration      height      id      thumbnailUrl      videoUrl      width      __typename    }    __typename  }  __typename}"`;
 
@@ -84,7 +120,8 @@ async function getObservations(accessToken, observationIds) {
 
   json.data.childDevelopment.observations.results.forEach((el) => {
     // Loop over the observations
-    createdAt = el.status.createdAt;
+    //console.log(el);
+    const createdAt = el.status.createdAt;
     el.images.forEach((image) => {
       const { height, width } = image;
       const { expires, key, path, prefix } = image.secret;
@@ -92,8 +129,11 @@ async function getObservations(accessToken, observationIds) {
       const url = `${prefix}/${key}/${width}x${height}/${path}?expires=${expires}`;
 
       const fileName = path.substring(path.lastIndexOf("/") + 1);
+      const fullFileName = createdAt + "_" + fileName;
 
-      downloadFile(url, createdAt + "_" + fileName);
+      downloadFile(url, fullFileName).then((path) => {
+        setExifData(path, new Date(createdAt));
+      });
     });
     if (el.video != null) {
       const url = el.video.videoUrl;
@@ -101,21 +141,47 @@ async function getObservations(accessToken, observationIds) {
       const fileName = removePathParam.substring(
         removePathParam.lastIndexOf("/") + 1
       );
+      const fullFileName = createdAt + "_" + fileName;
 
-      downloadFile(url, createdAt + "_" + fileName);
+      downloadFile(url, fullFileName).then((path) => {
+        setExifData(path, new Date(createdAt));
+      });
     }
   });
 }
 
 async function getFeed(accessToken) {
+  let date = new Date();
+  let numItemsFromFeed = 1;
+
+  while (numItemsFromFeed > 0) {
+    const { observationIds, oldestItem, numItems } = await getFeedItems(
+      accessToken,
+      date
+    );
+
+    numItemsFromFeed = numItems;
+
+    // Download the media from observations
+    await getObservations(accessToken, observationIds);
+
+    date = oldestItem;
+  }
+  console.log(
+    `Downloads finished. Oldest feed item downloaded = ${date}. Application will close once setting EXIF data is complete.`
+  );
+}
+
+async function getFeedItems(accessToken, olderThan) {
+  let oldestItem = olderThan;
+
+  const dateStr = olderThan.toISOString().split(".")[0] + "+00:00";
+  const encodedDateStr = encodeURIComponent(dateStr);
+
   const observationIds = [];
-  // The feed API is interesting in that it has two params: olderThan and heightTarget
-  // It appears to fetch the number of items that it think will fit within that heightTarget
-  // And only those older than olderThan.
-  // In this case we fetch the entire feed as our heightTarget is massive and olderThan is in the future
-  // FIXME: Don't fetch a massive payload in one go, split this up in sensible chunks
-  const feedURL =
-    "https://app.famly.co/api/feed/feed/feed?olderThan=2099-10-27T13%3A18%3A02%2B00%3A00&heightTarget=18600000000";
+
+  const feedURL = `https://app.famly.co/api/feed/feed/feed?olderThan=${encodedDateStr}&heightTarget=${heightTarget}`;
+  console.log(`Downloading feed items older than ${dateStr}. URL = ${feedURL}`);
   const res = await fetch(feedURL, {
     method: "GET",
     headers: {
@@ -126,8 +192,15 @@ async function getFeed(accessToken) {
   });
 
   const json = await res.json();
-  console.log(json.feedItems.length);
+  const numItems = json.feedItems.length;
+  //console.log(`Num Items from Feed === ${numItems}`);
   json.feedItems.forEach((feedItem) => {
+    const feedItemDate = new Date(feedItem.createdDate);
+    //console.log(`Feed Item Date === ${feedItemDate}`);
+
+    if (feedItemDate < oldestItem) {
+      oldestItem = feedItemDate;
+    }
     if (feedItem.embed != null && feedItem.embed.observationId != null) {
       // If the feedItem is an observation, just store the observationId
       // We will need it later when we query for the observation data
@@ -144,7 +217,10 @@ async function getFeed(accessToken) {
           const fileName = removePathParam.substring(
             removePathParam.lastIndexOf("/") + 1
           );
-          downloadFile(url, createdDate + "_" + fileName);
+          const fullFileName = createdDate + "_" + fileName;
+          downloadFile(url, fullFileName).then((path) => {
+            setExifData(path, new Date(createdDate));
+          });
         });
       }
 
@@ -172,13 +248,35 @@ async function getFeed(accessToken) {
           }
 
           const url = `${prefix}/${width}x${height}/${key}`;
+          const fileName = createdAt + "_" + imageId + suffix;
 
-          downloadFile(url, createdAt + "_" + imageId + suffix);
+          downloadFile(url, fileName).then((path) => {
+            setExifData(path, new Date(image.createdAt.date));
+          });
+        });
+      }
+
+      if (feedItem.files != null) {
+        feedItem.files.forEach((file) => {
+          // Set the filename to original filename (minus file extension) + date + file extension.
+          // For example: Document.pdf
+          // Becomes: Document-2023-02-01.pdf
+          const fileName = file.filename;
+          const fileNameSplit = fileName.split(".");
+          const extension = fileNameSplit[fileNameSplit.length - 1];
+          const fullFileName = `${fileName.substring(
+            0,
+            fileName.length - extension.length
+          )}-${feedItem.createdDate}.${extension}`;
+
+          const url = file.url;
+
+          downloadFile(url, fullFileName);
         });
       }
     }
   });
-  return observationIds;
+  return { observationIds, oldestItem, numItems };
 }
 
 /**
@@ -226,4 +324,25 @@ async function downloadFile(url, name) {
     method: "GET",
   });
   const writeStream = await streamPipeline(res.body, createWriteStream(path));
+  return path;
+}
+
+let numExifSet = 0;
+/**
+ * Set dates to EXIF data on files
+ * @param {String} path the path of the file to set EXIF data on
+ * @param {Date} date The date to set
+ */
+async function setExifData(path, date) {
+  if (disableExif) return;
+  exiftool.write(path, { AllDates: date.toISOString().split(".")[0] }, [
+    "-overwrite_original",
+  ]);
+  numExifSet++;
+  if (numExifSet % 100 === 0) {
+    console.log(`EXIF Progress. ${numExifSet} files complete`);
+  }
+  if (verbose) {
+    console.log(`Exif for file completed: ${path}`);
+  }
 }

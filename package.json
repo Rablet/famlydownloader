@@ -1,7 +1,7 @@
 {
-  "name": "familydownloader",
+  "name": "famlydownloader",
   "version": "1.0.0",
-  "description": "Download Famly pictures and observations",
+  "description": "Download Famly pictures and videos",
   "main": "app.js",
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
   "license": "ISC",
   "dependencies": {
     "commander": "^9.4.1",
+    "exiftool-vendored": "^21.2.0",
     "uuid": "^9.0.0"
   }
 }
