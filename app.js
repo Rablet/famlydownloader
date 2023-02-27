@@ -1,53 +1,103 @@
-import { createWriteStream, existsSync, mkdirSync } from "fs";
+import * as dotenv from "dotenv";
+dotenv.config();
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "fs";
 import { v4 } from "uuid";
-import { program } from "commander";
+import { program, Option } from "commander";
 
 import { pipeline } from "node:stream";
 import { promisify } from "node:util";
 
 import { exiftool } from "exiftool-vendored";
 
-program
-  .requiredOption("-u, --username <string>")
-  .requiredOption("-p, --password <string>")
-  .option(
+program.addOption(
+  new Option("-u, --username <string>", "Please specify username")
+    .env("FAMLY_USERNAME")
+    .makeOptionMandatory()
+);
+program.addOption(
+  new Option("-p, --password <string>", "Please specify password")
+    .env("FAMLY_PASSWORD")
+    .makeOptionMandatory()
+);
+program.addOption(
+  new Option(
     "-df, --download-folder <string>",
-    "Relative download folder.  Defaults to downloads/",
-    "downloads/"
+    "Please specify download folder"
   )
-  .option(
-    "--graphqlurl <string>",
-    "The URL for GraphQL.  Defaults to https://app.famly.co/graphql",
-    "https://app.famly.co/graphql"
-  )
-  .option(
-    "-d, --days <integer>",
-    "Number of days to download, defaults to 30. --download-since will take presedence over this",
-    "30"
-  )
-  .option(
+    .env("FAMLY_DOWNLOAD_FOLDER")
+    .default("downloads/")
+);
+program.addOption(
+  new Option("--graphqlurl <string>", "Please specify download folder")
+    .env("FAMLY_GRAPHQL_URL")
+    .default("https://app.famly.co/graphql")
+);
+program.addOption(
+  new Option(
     "-ds, --download-since <date>",
-    "Download all media posted after this date. Must be in a format accepted by the new Date() constructor. Takes priority over --days if both are specified"
-  )
-  .option("--disable-exif", "Disables setting the exif dates of photos.")
-  .option("-v", "--verbose", "Verbose logging.")
-  .option(
+    "Download all media posted after this date. Must be in a format accepted by the new Date() constructor. Takes priority over the --delta parameter"
+  ).env("FAMLY_DOWNLOAD_SINCE")
+);
+
+program.addOption(
+  new Option(
+    "-d, --delta",
+    "Downloads all media posted after the date in the .delta file."
+  ).env("FAMLY_DELTA")
+);
+
+program.addOption(
+  new Option(
+    "--disable-exif",
+    "Disables setting the exif dates of photos."
+  ).env("FAMLY_DISABLE_EXIF")
+);
+
+program.addOption(
+  new Option("-v, --verbose", "Enables verbose logging").env("FAMLY_VERBOSE")
+);
+
+program.addOption(
+  new Option(
     "-ht, --height-target <integer>",
-    "The height target to use when fetching feed items. Higher number = fewer requests.  Defaults to 10000",
-    10000
-  );
+    "The height target to use when fetching feed items. Higher number = fewer requests."
+  )
+    .default(10000)
+    .env("FAMLY_HEIGHT_TARGET")
+);
 
 program.parse();
 
 const options = program.opts();
-//const limit = options.first ? 1 : undefined;
+
+const famlyDeltaFilename = ".famlydownloaderdelta";
 const username = options.username;
+
 const password = options.password;
 const downloadFolder = options.downloadFolder;
 const graphqlURL = options.graphqlurl;
 
-const daysToDownload = options.days;
-const downloadMediaSince = new Date(options.downloadSince);
+// If downloadSince is set, use that date
+// Otherwise, if delta is set, use that date
+// If not, download everything again
+const downloadMediaSince = new Date(
+  options.downloadSince ||
+    (options.delta === undefined
+      ? undefined
+      : JSON.parse(readFileSync(famlyDeltaFilename, "utf8")).newestDownload)
+);
+
+if (isNaN(downloadMediaSince)) {
+  console.log(`Download all feed items.`);
+} else {
+  console.log(`Download all feed items created after: ${downloadMediaSince}`);
+}
 
 const disableExif = options.downloadSince;
 const verbose = options.verbose;
@@ -120,7 +170,6 @@ async function getObservations(accessToken, observationIds) {
 
   json.data.childDevelopment.observations.results.forEach((el) => {
     // Loop over the observations
-    //console.log(el);
     const createdAt = el.status.createdAt;
     el.images.forEach((image) => {
       const { height, width } = image;
@@ -153,26 +202,35 @@ async function getObservations(accessToken, observationIds) {
 async function getFeed(accessToken) {
   let date = new Date();
   let numItemsFromFeed = 1;
+  let newestDate = NaN;
 
   while (numItemsFromFeed > 0) {
-    const { observationIds, oldestItem, numItems } = await getFeedItems(
-      accessToken,
-      date
-    );
+    const { observationIds, oldestItem, newestItem, numItems } =
+      await getFeedItems(accessToken, date, newestDate);
 
     numItemsFromFeed = numItems;
 
     // Download the media from observations
-    await getObservations(accessToken, observationIds);
+    if (observationIds.length > 0) {
+      await getObservations(accessToken, observationIds);
+    }
 
     date = oldestItem;
+    newestDate = newestItem;
+  }
+
+  if (!isNaN(date)) {
+    writeFileSync(
+      famlyDeltaFilename,
+      JSON.stringify({ newestDownload: newestDate })
+    );
   }
   console.log(
-    `Downloads finished. Oldest feed item downloaded = ${date}. Application will close once setting EXIF data is complete.`
+    `Downloads finished. Oldest feed item downloaded = ${date}. Application will close once setting EXIF data is complete. This can take a long time.`
   );
 }
 
-async function getFeedItems(accessToken, olderThan) {
+async function getFeedItems(accessToken, olderThan, newestItem) {
   let oldestItem = olderThan;
 
   const dateStr = olderThan.toISOString().split(".")[0] + "+00:00";
@@ -192,14 +250,20 @@ async function getFeedItems(accessToken, olderThan) {
   });
 
   const json = await res.json();
-  const numItems = json.feedItems.length;
-  //console.log(`Num Items from Feed === ${numItems}`);
+  //const numItems = json.feedItems.length;
+  let numItems = 0;
   json.feedItems.forEach((feedItem) => {
     const feedItemDate = new Date(feedItem.createdDate);
-    //console.log(`Feed Item Date === ${feedItemDate}`);
+    if (!isNaN(downloadMediaSince) && feedItemDate <= downloadMediaSince) {
+      return;
+    }
+    numItems++;
 
     if (feedItemDate < oldestItem) {
       oldestItem = feedItemDate;
+    }
+    if (isNaN(newestItem) || feedItemDate > newestItem) {
+      newestItem = feedItemDate;
     }
     if (feedItem.embed != null && feedItem.embed.observationId != null) {
       // If the feedItem is an observation, just store the observationId
@@ -266,8 +330,8 @@ async function getFeedItems(accessToken, olderThan) {
           const extension = fileNameSplit[fileNameSplit.length - 1];
           const fullFileName = `${fileName.substring(
             0,
-            fileName.length - extension.length
-          )}-${feedItem.createdDate}.${extension}`;
+            fileName.length - (extension.length + 1)
+          )}_${feedItem.createdDate}.${extension}`;
 
           const url = file.url;
 
@@ -276,7 +340,7 @@ async function getFeedItems(accessToken, olderThan) {
       }
     }
   });
-  return { observationIds, oldestItem, numItems };
+  return { observationIds, oldestItem, newestItem, numItems };
 }
 
 /**
@@ -335,7 +399,7 @@ let numExifSet = 0;
  */
 async function setExifData(path, date) {
   if (disableExif) return;
-  exiftool.write(path, { AllDates: date.toISOString().split(".")[0] }, [
+  await exiftool.write(path, { AllDates: date.toISOString().split(".")[0] }, [
     "-overwrite_original",
   ]);
   numExifSet++;
