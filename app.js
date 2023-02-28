@@ -83,14 +83,20 @@ const password = options.password;
 const downloadFolder = options.downloadFolder;
 const graphqlURL = options.graphqlurl;
 
+const getDeltaDownloadDate = () => {
+  try {
+    return JSON.parse(readFileSync(famlyDeltaFilename, "utf8")).newestDownload;
+  } catch (err) {
+    return undefined;
+  }
+};
+
 // If downloadSince is set, use that date
 // Otherwise, if delta is set, use that date
 // If not, download everything again
 const downloadMediaSince = new Date(
   options.downloadSince ||
-    (options.delta === undefined
-      ? undefined
-      : JSON.parse(readFileSync(famlyDeltaFilename, "utf8")).newestDownload)
+    (options.delta === undefined ? undefined : getDeltaDownloadDate())
 );
 
 if (isNaN(downloadMediaSince)) {
